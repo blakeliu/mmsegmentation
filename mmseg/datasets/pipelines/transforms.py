@@ -1,12 +1,116 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
+import inspect
 
+import cv2
 import mmcv
 import numpy as np
 from mmcv.utils import deprecated_api_warning, is_tuple_of
 from numpy import random
 
+try:
+    import albumentations
+    from albumentations import Compose
+except ImportError:
+    albumentations = None
+    Compose = None
+
 from ..builder import PIPELINES
+
+
+@PIPELINES.register_module()
+class Albu:
+    """
+    https://albumentations.readthedocs.io
+    """
+
+    def __init__(self,
+                 transforms,
+                 keymap=None) -> None:
+        if Compose is None:
+            raise RuntimeError(
+                "albumentations is not installed, please 'pip install albumentations'")
+        self.transforms = copy.deepcopy(transforms)
+
+        self.aug = Compose([self.albu_builder(t) for t in self.transforms],
+                           bbox_params=None)
+
+        if keymap is not None:
+            self.keymap_to_albu = keymap
+        else:
+            self.keymap_to_albu = {
+                "img": "image",
+                "gt_semantic_seg": "mask"
+            }
+        self.keymap_back = {v: k for k, v in self.keymap_to_albu.items()}
+
+    def albu_builder(self, cfg):
+        """Import a module from albumentations
+
+        Args:
+            cfg (_type_): Config dict. It should at least contain the key "type"
+
+        Raises:
+            RuntimeError: _description_
+            TypeError: _description_
+
+        Returns:
+            _type_: _description_
+        """
+        assert isinstance(cfg, dict) and 'type' in cfg
+        args = cfg.copy()
+
+        obj_type = args.pop('type')
+        if isinstance(obj_type, str):
+            if albumentations is None:
+                raise RuntimeError(
+                    "albumentations is not installed, please 'pip install albumentations'")
+            obj_cls = getattr(albumentations, obj_type)
+        elif inspect.isclass(obj_type):
+            obj_cls = obj_type
+        else:
+            raise TypeError(
+                f"type must be str or class, but got {type(obj_type)}")
+        if 'transforms' in args:
+            args['transforms'] = [self.albu_builder(
+                t) for t in args['transforms']]
+
+        return obj_cls(**args)
+
+    @staticmethod
+    def mapper(d, keymap):
+        updated_dc = {}
+        for k, v in zip(d.keys(), d.values()):
+            new_k = keymap.get(k, k)
+            updated_dc[new_k] = d[k]
+        return updated_dc
+
+    def __call__(self, results):
+        """Call function to use albumentations function
+
+        Args:
+            results (dict): Result dict from loading pipeline.
+
+        Returns:
+            dict: Flipped results, 'flip', 'flip_direction' keys are added into
+                result dict.
+        """
+
+        results = self.mapper(results, self.keymap_to_albu)
+
+        # Convert bgr to rgb becasuse albumentations work with rgb, but mmcv read image in bgr
+        results['image'] = cv2.cvtColor(results['image'], cv2.COLOR_BGR2RGB)
+        results = self.aug(**results)
+        results['image'] = cv2.cvtColor(results['image'], cv2.COLOR_RGB2BGR)
+
+        results = self.mapper(results, self.keymap_back)
+
+        results['img_shape'] = results['img'].shape
+
+        return results
+
+    def __repr__(self):
+        return self.__class__.__name__ + f'(transforms={self.transforms})'
 
 
 @PIPELINES.register_module()
